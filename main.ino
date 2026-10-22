@@ -43,7 +43,7 @@ TEST:
 
   if (digitalRead(BUTTON_COPY) == 1) {
     delay(150);
-    loadDefaultThresholds();
+    loadDefaultCalibration();
     saveCalibration();
     displayText(2, 43, 20, "Copy", true, true);
     delay(250);

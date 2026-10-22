@@ -7,7 +7,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-#include "sensor_map.h"
+#include "control_math.h"
 
 // Pins
 constexpr uint8_t BUZZER_PIN = 12;
@@ -38,11 +38,12 @@ constexpr int LIFT_DOWN = 147;
 constexpr int LIFT_PLACE = 115;
 
 // Line sensor calibration
-constexpr uint8_t SENSOR_COUNT = 8;
 constexpr uint8_t DEFAULT_THRESHOLDS[SENSOR_COUNT] = {113, 134, 127, 129,
                                                       124, 132, 121, 103};
-constexpr int CALIBRATION_MARKER = 0x5A5A;
+constexpr int CALIBRATION_MARKER = 0x5A5B;
 constexpr unsigned long SEARCH_TIMEOUT_MS = 10000UL;
+constexpr int MIN_LINE_STRENGTH = 400;
+constexpr int MOTOR_DEADBAND = 40;
 
 constexpr uint8_t LEFT_EDGE_MASK = 0b10000000;
 constexpr uint8_t CENTER_EDGE_MASK = 0b01000010;
@@ -50,9 +51,14 @@ constexpr uint8_t CENTER_EDGE_MASK = 0b01000010;
 // Line following
 constexpr int SET_POINT = 0;
 constexpr int KP = 5;
-constexpr int KD = 118;
+constexpr int KD = 10;
+constexpr int DERIVATIVE_ALPHA = 30;
 constexpr int SAMPLE_MS = 4;
 constexpr int MIN_PWM = 0;
+constexpr int EDGE_POSITION = 28;
+constexpr int PIVOT_SPEED = 140;
+constexpr int SEARCH_SPEED = 100;
+constexpr uint8_t DEBOUNCE_SAMPLES = 3;
 
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Servo gripper;
@@ -61,9 +67,14 @@ Servo lift;
 uint8_t rawSensor[SENSOR_COUNT];
 uint8_t sensorOnLine[SENSOR_COUNT];
 int threshold[SENSOR_COUNT];
+int sensorMin[SENSOR_COUNT];
+int sensorMax[SENSOR_COUNT];
 uint8_t sensorMask = 0;
+long lineStrength = 0;
 int linePosition = 0;
 int lastError = 0;
+int filteredDerivative = 0;
+int lastSeenSide = 1;
 
 void selectMuxChannel(uint8_t channelA, uint8_t channelB, uint8_t channelC) {
   digitalWrite(MUX_SELECT_A, channelA);
@@ -116,14 +127,33 @@ void saveCalibration() {
     EEPROM.put(address, threshold[i]);
     address += sizeof(int);
   }
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    EEPROM.put(address, sensorMin[i]);
+    address += sizeof(int);
+  }
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    EEPROM.put(address, sensorMax[i]);
+    address += sizeof(int);
+  }
   EEPROM.put(address, CALIBRATION_MARKER);
 }
 
 bool loadCalibration() {
-  int stored[SENSOR_COUNT];
+  int storedThreshold[SENSOR_COUNT];
+  int storedMin[SENSOR_COUNT];
+  int storedMax[SENSOR_COUNT];
   int address = 0;
+
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
-    EEPROM.get(address, stored[i]);
+    EEPROM.get(address, storedThreshold[i]);
+    address += sizeof(int);
+  }
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    EEPROM.get(address, storedMin[i]);
+    address += sizeof(int);
+  }
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    EEPROM.get(address, storedMax[i]);
     address += sizeof(int);
   }
 
@@ -134,14 +164,18 @@ bool loadCalibration() {
   }
 
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
-    threshold[i] = stored[i];
+    threshold[i] = storedThreshold[i];
+    sensorMin[i] = storedMin[i];
+    sensorMax[i] = storedMax[i];
   }
   return true;
 }
 
-void loadDefaultThresholds() {
+void loadDefaultCalibration() {
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
     threshold[i] = DEFAULT_THRESHOLDS[i];
+    sensorMin[i] = 0;
+    sensorMax[i] = 255;
   }
 }
 
@@ -171,12 +205,19 @@ void calibrate(int samples) {
   }
 
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
-    threshold[i] = (minReading[i] + maxReading[i]) / 2;
+    if (maxReading[i] - minReading[i] >= MIN_CONTRAST) {
+      sensorMin[i] = minReading[i];
+      sensorMax[i] = maxReading[i];
+    }
+    threshold[i] = (sensorMin[i] + sensorMax[i]) / 2;
   }
   saveCalibration();
 }
 
 void driveMotors(int leftPwm, int rightPwm) {
+  leftPwm = applyDeadband(leftPwm, MOTOR_DEADBAND);
+  rightPwm = applyDeadband(rightPwm, MOTOR_DEADBAND);
+
   if (leftPwm > 0) {
     analogWrite(MOTOR_LEFT_FWD, leftPwm);
     analogWrite(MOTOR_LEFT_REV, 0);
@@ -221,30 +262,47 @@ void beep(int times, int durationMs) {
 
 void updateLineState() {
   readSensors();
+
+  uint16_t strength[SENSOR_COUNT];
   sensorMask = 0;
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+    strength[i] = normalizedStrength(rawSensor[i], sensorMin[i], sensorMax[i]);
     sensorOnLine[i] = rawSensor[i] > threshold[i] ? 1 : 0;
     sensorMask = (sensorMask << 1) | sensorOnLine[i];
   }
-  linePosition = linePositionFromBits(sensorOnLine);
+  linePosition = centroidPosition(strength, &lineStrength);
 }
 
 void followLine(int baseSpeed) {
   updateLineState();
 
-  int error = SET_POINT - linePosition;
-  int correction = (KP * error) + ((KD / SAMPLE_MS) * (error - lastError));
-  lastError = error;
+  if (lineStrength < MIN_LINE_STRENGTH) {
+    int direction = lastSeenSide >= 0 ? 1 : -1;
+    lastError = 0;
+    filteredDerivative = 0;
+    driveMotors(direction * SEARCH_SPEED, -direction * SEARCH_SPEED);
+    delay(SAMPLE_MS);
+    return;
+  }
+  lastSeenSide = linePosition >= 0 ? 1 : -1;
 
-  int leftPwm = constrain(baseSpeed + correction, MIN_PWM, baseSpeed);
-  int rightPwm = constrain(baseSpeed - correction, MIN_PWM, baseSpeed);
+  int error = SET_POINT - linePosition;
+  int derivative = error - lastError;
+  lastError = error;
+  filteredDerivative = lowPassStep(filteredDerivative, derivative, DERIVATIVE_ALPHA);
+
+  int correction = KP * error + KD * filteredDerivative;
+  correction = constrain(correction, -baseSpeed, baseSpeed);
+
+  int leftPwm = constrain(baseSpeed - correction, MIN_PWM, baseSpeed);
+  int rightPwm = constrain(baseSpeed + correction, MIN_PWM, baseSpeed);
   driveMotors(leftPwm, rightPwm);
 
-  if (linePosition < -25) {
-    driveMotors(-baseSpeed, baseSpeed);
+  if (linePosition <= -EDGE_POSITION) {
+    driveMotors(-PIVOT_SPEED, PIVOT_SPEED);
   }
-  if (linePosition > 25) {
-    driveMotors(baseSpeed, -baseSpeed);
+  if (linePosition >= EDGE_POSITION) {
+    driveMotors(PIVOT_SPEED, -PIVOT_SPEED);
   }
 
   delay(SAMPLE_MS);
@@ -299,20 +357,26 @@ void waitCrossings(uint8_t mask, int crossings, int speed) {
   unsigned long startedAt = millis();
 
   while (count < crossings) {
-    while ((sensorMask & mask) != mask) {
+    int streak = 0;
+    while (streak < DEBOUNCE_SAMPLES) {
       if (millis() - startedAt > SEARCH_TIMEOUT_MS) {
         stopMotors();
         return;
       }
+      streak = ((sensorMask & mask) == mask) ? streak + 1 : 0;
       followLine(speed);
     }
-    while ((sensorMask & mask) == mask) {
+
+    streak = 0;
+    while (streak < DEBOUNCE_SAMPLES) {
       if (millis() - startedAt > SEARCH_TIMEOUT_MS) {
         stopMotors();
         return;
       }
+      streak = ((sensorMask & mask) != mask) ? streak + 1 : 0;
       followLine(speed);
     }
+
     beep(1, 5);
     count++;
   }
@@ -347,6 +411,6 @@ void initHardware() {
   lift.write(LIFT_UP);
 
   if (!loadCalibration()) {
-    loadDefaultThresholds();
+    loadDefaultCalibration();
   }
 }
