@@ -55,10 +55,14 @@ constexpr int KD = 10;
 constexpr int DERIVATIVE_ALPHA = 30;
 constexpr int SAMPLE_MS = 4;
 constexpr int MIN_PWM = 0;
-constexpr int EDGE_POSITION = 28;
-constexpr int PIVOT_SPEED = 140;
 constexpr int SEARCH_SPEED = 100;
 constexpr uint8_t DEBOUNCE_SAMPLES = 3;
+
+// Recovery when the line is lost
+constexpr unsigned long RECOVERY_COAST_MS = 150;
+constexpr unsigned long RECOVERY_SEARCH_MS = 1200;
+constexpr unsigned long RECOVERY_SWEEP_MS = 220;
+constexpr int SEARCH_BIAS = 50;
 
 // Dashed-line following (terpisah dari followLine)
 constexpr unsigned long DASHED_COAST_MS = 250;
@@ -84,6 +88,10 @@ int linePosition = 0;
 int lastError = 0;
 int filteredDerivative = 0;
 int lastSeenSide = 1;
+
+bool lineLost = false;
+unsigned long lineLostSince = 0;
+int lineLastCorrection = 0;
 
 bool dashedLineWasVisible = false;
 bool dashedInGap = false;
@@ -294,33 +302,61 @@ void followLine(int baseSpeed) {
   updateLineState();
 
   if (lineStrength < MIN_LINE_STRENGTH) {
-    int direction = lastSeenSide >= 0 ? 1 : -1;
-    lastError = 0;
-    filteredDerivative = 0;
-    driveMotors(direction * SEARCH_SPEED, -direction * SEARCH_SPEED);
+    if (!lineLost) {
+      lineLost = true;
+      lineLostSince = millis();
+    }
+
+    unsigned long hiddenMs = millis() - lineLostSince;
+
+    if (hiddenMs < RECOVERY_COAST_MS) {
+      int coastCorrection =
+          constrain(lineLastCorrection, -baseSpeed, baseSpeed);
+      int leftPwm = constrain(baseSpeed - coastCorrection, MIN_PWM, baseSpeed);
+      int rightPwm = constrain(baseSpeed + coastCorrection, MIN_PWM, baseSpeed);
+      driveMotors(leftPwm, rightPwm);
+      delay(SAMPLE_MS);
+      return;
+    }
+
+    if (hiddenMs < RECOVERY_COAST_MS + RECOVERY_SEARCH_MS) {
+      int direction =
+          lastSeenSide *
+          sweepDirection(hiddenMs, RECOVERY_COAST_MS, RECOVERY_SWEEP_MS);
+      int leftPwm = SEARCH_SPEED + direction * SEARCH_BIAS;
+      int rightPwm = SEARCH_SPEED - direction * SEARCH_BIAS;
+      driveMotors(constrain(leftPwm, 0, 255), constrain(rightPwm, 0, 255));
+      delay(SAMPLE_MS);
+      return;
+    }
+
+    driveMotors(0, 0);
     delay(SAMPLE_MS);
     return;
   }
+
   lastSeenSide = linePosition >= 0 ? 1 : -1;
 
   int error = SET_POINT - linePosition;
+  if (lineLost) {
+    // Bumpless reacquire: cegah lonjakan suku D setelah garis hilang.
+    lineLost = false;
+    lastError = error;
+    filteredDerivative = 0;
+  }
+
   int derivative = error - lastError;
   lastError = error;
-  filteredDerivative = lowPassStep(filteredDerivative, derivative, DERIVATIVE_ALPHA);
+  filteredDerivative =
+      lowPassStep(filteredDerivative, derivative, DERIVATIVE_ALPHA);
 
   int correction = KP * error + KD * filteredDerivative;
   correction = constrain(correction, -baseSpeed, baseSpeed);
+  lineLastCorrection = correction;
 
   int leftPwm = constrain(baseSpeed - correction, MIN_PWM, baseSpeed);
   int rightPwm = constrain(baseSpeed + correction, MIN_PWM, baseSpeed);
   driveMotors(leftPwm, rightPwm);
-
-  if (linePosition <= -EDGE_POSITION) {
-    driveMotors(-PIVOT_SPEED, PIVOT_SPEED);
-  }
-  if (linePosition >= EDGE_POSITION) {
-    driveMotors(PIVOT_SPEED, -PIVOT_SPEED);
-  }
 
   delay(SAMPLE_MS);
 }
