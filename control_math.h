@@ -52,3 +52,33 @@ inline int applyDeadband(int pwm, int deadband) {
 inline int lowPassStep(int previous, int current, int alphaPercent) {
   return (alphaPercent * current + (100 - alphaPercent) * previous) / 100;
 }
+
+// Fase celah pada garis putus-putus.
+enum GapPhase { GAP_COAST, GAP_SEARCH, GAP_LOST };
+
+// Hysteresis: ambil garis di enterStrength, pertahankan sampai releaseStrength.
+inline bool lineSeen(int strength, bool wasVisible, int enterStrength,
+                     int releaseStrength) {
+  return wasVisible ? strength >= releaseStrength : strength >= enterStrength;
+}
+
+inline GapPhase gapPhase(unsigned long hiddenMs, unsigned long coastMs,
+                         unsigned long searchMs) {
+  if (hiddenMs < coastMs) {
+    return GAP_COAST;
+  }
+  if (hiddenMs < coastMs + searchMs) {
+    return GAP_SEARCH;
+  }
+  return GAP_LOST;
+}
+
+// Arah sapuan bergantian +1/-1 setiap sweepMs setelah fase coast.
+inline int sweepDirection(unsigned long hiddenMs, unsigned long coastMs,
+                          unsigned long sweepMs) {
+  if (hiddenMs < coastMs) {
+    return 1;
+  }
+  unsigned long index = (hiddenMs - coastMs) / sweepMs;
+  return (index % 2 == 0) ? 1 : -1;
+}

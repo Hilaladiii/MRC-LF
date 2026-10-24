@@ -64,6 +64,22 @@ int main() {
   expectInt("lowpass fall", 70, lowPassStep(100, 0, 30));
   expectInt("lowpass negative", -30, lowPassStep(0, -100, 30));
 
+  expectInt("line seen at enter", 1, lineSeen(400, false, 400, 300));
+  expectInt("line hidden below enter", 0, lineSeen(399, false, 400, 300));
+  expectInt("line held by hysteresis", 1, lineSeen(300, true, 400, 300));
+  expectInt("line released below hysteresis", 0, lineSeen(299, true, 400, 300));
+
+  expectInt("gap coast start", 0, gapPhase(0, 250, 1500));
+  expectInt("gap coast before limit", 0, gapPhase(249, 250, 1500));
+  expectInt("gap search at limit", 1, gapPhase(250, 250, 1500));
+  expectInt("gap search before lost", 1, gapPhase(1749, 250, 1500));
+  expectInt("gap lost at limit", 2, gapPhase(1750, 250, 1500));
+
+  expectInt("sweep starts right", 1, sweepDirection(250, 250, 180));
+  expectInt("sweep flips left", -1, sweepDirection(430, 250, 180));
+  expectInt("sweep flips back right", 1, sweepDirection(610, 250, 180));
+  expectInt("sweep before coast", 1, sweepDirection(100, 250, 180));
+
   if (failures == 0) {
     std::printf("all control math cases pass\n");
   }

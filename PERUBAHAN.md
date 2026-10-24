@@ -6,8 +6,8 @@ setiap bagian kode.
 
 - Kode awal: `config.h` 623 baris, `main.ino` 92 baris, `track.h` 724 baris
   (total 1.439 baris), nama variabel campur Indonesia/Inggris, banyak dead code.
-- Versi sekarang: `config.h` 416, `control_math.h` 54, `main.ino` 63,
-  `track.h` 359 (total 892 baris firmware) + 71 baris test.
+- Versi sekarang: `config.h` 519, `control_math.h` 84, `main.ino` 63,
+  `track.h` 359 (total 1.025 baris firmware) + 87 baris test.
 - Angka jarak/kecepatan di lintasan (`runCourse()`) **tidak diubah**.
 
 ---
@@ -62,6 +62,7 @@ di dokumen ini berasal dari kode awal sesi.
 | 18 | Crossing dihitung dari satu sampel | Garis tebal/reflektif dihitung dua kali atau terlewat | Debounce 3 sampel berturut |
 | 19 | Arah steering sempat terbalik saat refactor | Roda kiri/kanan tertukar dibanding `motor(ki, ka)` asli | Dikembalikan ke `left = base − PD`, `right = base + PD` |
 | 20 | Nama variabel tidak konsisten | Sulit dibaca dan dirawat | Rename menyeluruh ke bahasa Inggris |
+| 21 | Garis putus-putus memicu pivot tiap celah | Robot berputar dan keluar jalur di setiap celah | `followLineDashed()` terpisah: coast, sweep, reacquire debounce |
 
 ### Penjelasan masalah utama
 
@@ -82,6 +83,11 @@ robot mencari pelan ke sisi terakhir, bukan berputar kencang.
 `motor(ki, ka)`. Saat refactor, sempat menjadi `left = base + correction`,
 `right = base − correction`, yang membalik arah koreksi. Sudah dikembalikan
 dan diverifikasi terhadap kode asli.
+
+**Garis putus-putus (21).** `followLine()` menganggap setiap celah sebagai garis
+hilang total dan langsung pivot. `followLineDashed()` mempertahankan koreksi
+terakhir selama `DASHED_COAST_MS`, lalu menyapu kiri/kanan; `followLine()` dan
+`runCourse()` tidak diubah.
 
 ---
 
@@ -124,36 +130,56 @@ dan diverifikasi terhadap kode asli.
 - Alasan: input sensor berubah diskrit; tanpa filter, suku D melonjak.
 - Masalah yang diselesaikan: overshoot dan getaran akibat derivative spike.
 
+**`lineSeen(strength, wasVisible, enterStrength, releaseStrength)`** (`control_math.h:60`)
+- Tujuan: hysteresis status garis.
+- Cara kerja: jika sebelumnya terlihat, cukup `>= releaseStrength`; jika belum,
+  harus `>= enterStrength`.
+- Alasan: mencegah status garis berkedip di sekitar satu ambang.
+- Masalah yang diselesaikan: coast/reacquire berulang saat kekuatan garis marginal.
+
+**`gapPhase(hiddenMs, coastMs, searchMs)`** (`control_math.h:65`)
+- Tujuan: menentukan fase celah: coast, search, atau lost.
+- Cara kerja: `hiddenMs < coastMs` → coast; `< coastMs + searchMs` → search;
+  selebihnya lost.
+- Alasan: batas waktu eksplisit, bukan jumlah sampel yang bergantung timing.
+- Masalah yang diselesaikan: keputusan garis hilang yang tidak konsisten.
+
+**`sweepDirection(hiddenMs, coastMs, sweepMs)`** (`control_math.h:77`)
+- Tujuan: arah sapuan +1/−1 bergantian selama fase search.
+- Cara kerja: indeks `(hiddenMs − coastMs) / sweepMs`, genap +1, ganjil −1.
+- Alasan: sapuan bolak-balik tanpa state tambahan.
+- Masalah yang diselesaikan: robot hanya menyapu ke satu arah.
+
 ### 4.2 `config.h` — hardware dan tampilan
 
-**`selectMuxChannel(a, b, c)`** (`config.h:79`)
+**`selectMuxChannel(a, b, c)`** (`config.h:96`)
 - Tujuan: memilih kanal 0–7 pada multiplexer 4051 lewat pin A0/A1/A2.
 - Perubahan: nama dari `selector()`, pin dari `A/B/C` menjadi `MUX_SELECT_A/B/C`.
 
-**`readSensors()`** (`config.h:85`)
+**`readSensors()`** (`config.h:102`)
 - Tujuan: membaca 8 sensor ke `rawSensor[0..7]` (kanal 7 dibaca lebih dulu).
 - Perubahan: nama dari `readSelector()`, tetap `analogRead(...) / 4` (0–255).
 - Catatan: urutan pembacaan dipertahankan agar timing tidak berubah.
 
-**`displayText(size, x, y, text, refresh, clear)`** (`config.h:104`)
+**`displayText(size, x, y, text, refresh, clear)`** (`config.h:121`)
 - Tujuan: menulis teks ke OLED, dengan opsi hapus layar dan refresh.
 - Perubahan: nama dari `lcd_char()`, parameter `String` diganti `const char *`
   supaya tidak membuat alokasi String di AVR.
 
-**`drawProgressBar(x, y, w, h, percent)`** (`config.h:118`)
+**`drawProgressBar(x, y, w, h, percent)`** (`config.h:135`)
 - Tujuan: progress bar kalibrasi.
 - Perubahan: hanya nama (dari `drawProgressbar`).
 
 ### 4.3 `config.h` — kalibrasi dan EEPROM
 
-**`saveCalibration()`** (`config.h:124`)
+**`saveCalibration()`** (`config.h:141`)
 - Tujuan: menyimpan `threshold[8]`, `sensorMin[8]`, `sensorMax[8]`, lalu marker
   `0x5A5B` ke EEPROM.
 - Perubahan: dulu hanya menyimpan 3 array tanpa marker, dan `sensorMin/Max`
   tidak pernah disimpan karena tidak dipakai.
 - Layout: 0–15 threshold, 16–31 min, 32–47 max, 48–49 marker (50 byte).
 
-**`loadCalibration()`** (`config.h:141`)
+**`loadCalibration()`** (`config.h:158`)
 - Tujuan: membaca kalibrasi dari EEPROM saat boot.
 - Cara kerja: baca ke variabel lokal, cek marker, baru salin ke variabel global.
 - Alasan: EEPROM kosong bernilai `0xFF`. Tanpa marker, ambang menjadi −1 dan
@@ -161,12 +187,12 @@ dan diverifikasi terhadap kode asli.
 - Masalah yang diselesaikan: kalibrasi hilang setelah power cycle; data sampah
   saat pertama kali flashing.
 
-**`loadDefaultCalibration()`** (`config.h:174`)
+**`loadDefaultCalibration()`** (`config.h:191`)
 - Tujuan: memakai tabel `DEFAULT_THRESHOLDS`, `sensorMin = 0`, `sensorMax = 255`.
 - Alasan: fallback yang aman sebelum pengguna melakukan kalibrasi.
 - Dipakai oleh `initHardware()` dan tombol Copy.
 
-**`calibrate(samples)`** (`config.h:182`)
+**`calibrate(samples)`** (`config.h:199`)
 - Tujuan: mengambil sampel beberapa kali, mencatat min/max tiap sensor,
   menghitung ambang, lalu menyimpan.
 - Perubahan: rumus ambang diperbaiki menjadi `(min + max) / 2`.
@@ -176,7 +202,7 @@ dan diverifikasi terhadap kode asli.
 
 ### 4.4 `config.h` — motor dan aktuator
 
-**`driveMotors(leftPwm, rightPwm)`** (`config.h:217`)
+**`driveMotors(leftPwm, rightPwm)`** (`config.h:234`)
 - Tujuan: satu-satunya tempat yang menulis ke pin motor.
 - Cara kerja: terapkan deadband, lalu tentukan arah berdasarkan tanda PWM.
 - Perubahan: menggabungkan `motor()`, `right()`, `left()`, `forward()`,
@@ -185,24 +211,24 @@ dan diverifikasi terhadap kode asli.
   roda kanan ke arah sebaliknya. Satu fungsi menghilangkan kemungkinan itu.
 - Masalah yang diselesaikan: polaritas tidak konsisten dan duplikasi.
 
-**`brake(durationMs)`** (`config.h:244`)
+**`brake(durationMs)`** (`config.h:261`)
 - Tujuan: matikan motor lalu tunggu. Nama dari `rem()`. Memakai `driveMotors(0,0)`.
 
-**`stopMotors()`** (`config.h:249`)
+**`stopMotors()`** (`config.h:266`)
 - Tujuan: matikan motor dan tutup gripper. Nama dari `Stop()`.
 - Alasan: dipakai menu, timeout, dan sebelum kalibrasi.
 
-**`beep(times, durationMs)`** (`config.h:254`)
+**`beep(times, durationMs)`** (`config.h:271`)
 - Tujuan: pola bunyi buzzer. Nama dari `bip()`.
 
-**`liftUp(stepDelay)` / `liftDown(stepDelay)`** (`config.h:341`, `348`)
+**`liftUp(stepDelay)` / `liftDown(stepDelay)`** (`config.h:444`, `451`)
 - Tujuan: menggerakkan servo lift dari `LIFT_DOWN` ke `LIFT_UP` atau sebaliknya.
 - Perubahan: nama dari `naik()` / `turun()`, parameter diberi nama jelas.
 - Catatan: tetap blocking; angka servo tidak berubah.
 
 ### 4.5 `config.h` — line following
 
-**`updateLineState()`** (`config.h:263`)
+**`updateLineState()`** (`config.h:280`)
 - Tujuan: satu kali baca sensor menghasilkan semua state kontrol:
   `rawSensor`, `sensorOnLine`, `sensorMask`, `linePosition`, `lineStrength`.
 - Perubahan: menggabungkan `convertLogic()` + `logic()`.
@@ -211,7 +237,7 @@ dan diverifikasi terhadap kode asli.
 - Masalah yang diselesaikan: informasi sensor hilang karena threshold terlalu
   awal, dan error basi pada pola yang tidak dikenal.
 
-**`followLine(baseSpeed)`** (`config.h:276`)
+**`followLine(baseSpeed)`** (`config.h:293`)
 - Tujuan: kontroler utama saat mengikuti garis.
 - Urutan:
   1. `updateLineState()`.
@@ -226,26 +252,45 @@ dan diverifikasi terhadap kode asli.
   - Suku D difilter; `KD` tidak lagi dibagi `SAMPLE_MS`.
   - Tidak ada lagi spin PWM penuh saat garis hilang.
 - Masalah yang diselesaikan: zig-zag, overshoot, dan putaran liar.
+- Catatan: untuk garis putus-putus gunakan `followLineDashed()`.
 
-**`driveForward(leftPwm, rightPwm, seconds)`** (`config.h:311`)
+**`followLineDashed(baseSpeed)`** (`config.h:330`)
+- Tujuan: line follower terpisah untuk garis putus-putus.
+- Urutan:
+  1. `updateLineState()` dan hysteresis `lineSeen()`.
+  2. Jika garis terlihat (3 sampel setelah gap): PD seperti `followLine()`,
+     simpan `dashedLastCorrection`.
+  3. Jika hilang `< DASHED_COAST_MS`: maju dengan koreksi terakhir (coast).
+  4. Jika hilang sampai `DASHED_COAST_MS + DASHED_SEARCH_MS`: maju pelan sambil
+     menyapu kiri/kanan tiap `DASHED_SWEEP_MS`.
+  5. Jika lebih lama: `driveMotors(0, 0)` sampai garis terlihat lagi.
+- Perbedaan dari `followLine()`: tidak ada pivot `EDGE_POSITION`; reacquire
+  me-reset suku D; state kontrol terpisah (`dashed*`).
+- Catatan: belum dipanggil dari `runCourse()`.
+
+**`driveForward(leftPwm, rightPwm, seconds)`** (`config.h:408`)
 - Tujuan: maju dengan PWM tetap selama kira-kira `seconds` detik.
 - Perubahan: nama dari `tForward()`, `j = i` dihapus.
 - Catatan: open-loop; jarak bergantung pada baterai dan beban.
 
-**`driveBackward(leftPwm, rightPwm, seconds)`** (`config.h:317`)
+**`driveBackward(leftPwm, rightPwm, seconds)`** (`config.h:414`)
 - Tujuan: mundur dengan PWM tetap. Nama dari `tBackward()`.
 
-**`followLineForTicks(speed, ticks)`** (`config.h:323`)
+**`followLineForTicks(speed, ticks)`** (`config.h:420`)
 - Tujuan: mengikuti garis selama `ticks * 10` siklus kontrol.
 - Perubahan: nama dari `tik()`.
 
-**`turnRight(leftPwm, rightPwm, ticks)`** (`config.h:329`)
+**`followLineForTicksDashed(speed, ticks)`** (`config.h:426`)
+- Tujuan: wrapper `ticks * 10` siklus `followLineDashed()`; drop-in untuk
+  `followLineForTicks()` saat integrasi nanti.
+
+**`turnRight(leftPwm, rightPwm, ticks)`** (`config.h:432`)
 - Tujuan: pivot kanan selama `ticks * 500` iterasi. Nama dari `tRight()`.
 
-**`turnLeft(leftPwm, rightPwm, ticks)`** (`config.h:335`)
+**`turnLeft(leftPwm, rightPwm, ticks)`** (`config.h:438`)
 - Tujuan: pivot kiri selama `ticks * 500` iterasi. Nama dari `tLeft()`.
 
-**`waitCrossings(mask, crossings, speed)`** (`config.h:355`)
+**`waitCrossings(mask, crossings, speed)`** (`config.h:458`)
 - Tujuan: berjalan sampai pola sensor `mask` terdeteksi sebanyak `crossings`.
 - Cara kerja: fase "menunggu set" dan "menunggu clear", masing-masing harus
   bertahan `DEBOUNCE_SAMPLES` sampel; ada timeout `SEARCH_TIMEOUT_MS`.
@@ -253,7 +298,7 @@ dan diverifikasi terhadap kode asli.
 - Masalah yang diselesaikan: hitungan ganda, hitungan terlewat, dan loop tanpa
   akhir.
 
-**`initHardware()`** (`config.h:385`)
+**`initHardware()`** (`config.h:488`)
 - Tujuan: inisialisasi pin, servo, OLED, posisi awal, dan memuat kalibrasi.
 - Perubahan: nama dari `io_init()`, `Serial.begin()` dihapus (tidak ada lagi
   output serial hidup), dan `copy()` diganti `loadCalibration()` dengan
@@ -388,6 +433,9 @@ dan diverifikasi terhadap kode asli.
    dua kali.
 7. **Angka lintasan tidak berubah.** Semua nilai di `runCourse()` diverifikasi
    identik dengan `biru()` lama.
+8. **Fungsi dashed belum aktif.** `followLineDashed()` dan
+   `followLineForTicksDashed()` ditambahkan terpisah; `followLine()` dan
+   `runCourse()` tidak berubah sampai integrasi dilakukan.
 
 ---
 
@@ -407,10 +455,17 @@ dan diverifikasi terhadap kode asli.
 | `DEBOUNCE_SAMPLES` | 3 | jumlah sampel untuk satu crossing |
 | `SEARCH_TIMEOUT_MS` | 10000 | batas waktu mencari crossing |
 | `SAMPLE_MS` | 4 | periode loop kontrol |
+| `DASHED_COAST_MS` | 250 | batas coast sebelum mencari garis |
+| `DASHED_SEARCH_MS` | 1500 | lama sapuan sebelum berhenti |
+| `DASHED_SWEEP_MS` | 180 | periode ganti arah sapuan |
+| `DASHED_REACQUIRE_SAMPLES` | 3 | sampel berturut untuk menganggap garis kembali |
+| `DASHED_RELEASE_STRENGTH` | 300 | ambang hysteresis saat garis sudah terlihat |
+| `DASHED_SEARCH_SPEED` | 100 | PWM maju saat menyapu |
+| `DASHED_SWEEP_BIAS` | 55 | selisih PWM kiri/kanan saat menyapu |
 
 Urutan tuning yang disarankan: `KD = 0`, `MOTOR_DEADBAND = 0` → naikkan `KP`
 sampai hampir osilasi → ukur deadband → naikkan `KD` → uji garis hilang →
-jalankan lintasan penuh.
+uji garis putus-putus (`DASHED_COAST_MS`) → jalankan lintasan penuh.
 
 ---
 
@@ -418,9 +473,10 @@ jalankan lintasan penuh.
 
 Yang sudah dilakukan:
 
-- Test host `tests/test_control_math.cpp`: 23 assertion lulus, mencakup
+- Test host `tests/test_control_math.cpp`: 36 assertion lulus, mencakup
   normalisasi, kontras rendah, centroid (sensor tunggal, pasangan tengah,
-  pasangan asimetris, tepi simetris, kosong), deadband, dan filter.
+  pasangan asimetris, tepi simetris, kosong), deadband, filter, hysteresis
+  garis, fase celah, dan arah sapuan.
 - Syntax check seluruh sketch memakai stub header Arduino: lulus.
 - Pengecekan angka: seluruh angka di `runCourse()` dibandingkan dengan
   `biru()` lama dan identik.
@@ -432,6 +488,8 @@ Yang belum dilakukan:
 - Build dan flash dengan Arduino IDE/`arduino-cli` sungguhan (toolchain dan
   library tidak tersedia di mesin ini).
 - Uji di lintasan: tuning `KP`/`KD`/deadband dan verifikasi recovery.
+- Integrasi `followLineDashed()` ke segmen putus-putus di `runCourse()`.
+- Uji `followLineDashed()` di lintasan bergaris putus-putus.
 
 Cara menjalankan test:
 
@@ -447,6 +505,8 @@ g++ -std=c++11 -Wall -Wextra tests/test_control_math.cpp -o /tmp/test_control_ma
 - **Lintasan masih open-loop.** `driveForward`, `turnRight`, `turnLeft`, dan
   `followLineForTicks` bergantung pada waktu dan tegangan baterai. Ini sumber
   error terbesar, bukan kontroler garis.
+- **Garis putus-putus.** `followLineDashed()` menangani celah < 5 cm dengan
+  coast. Celah lebih panjang atau kecepatan tinggi memerlukan encoder/IMU.
 - **Roda dalam belum bisa berbalik.** `MIN_PWM = 0`; tikungan tajam ditangani
   oleh pivot. Membalik roda dalam adalah eksperimen terpisah.
 - **Tidak ada encoder/IMU/kamera.** Untuk stabilitas lintasan, IMU (heading

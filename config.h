@@ -60,6 +60,15 @@ constexpr int PIVOT_SPEED = 140;
 constexpr int SEARCH_SPEED = 100;
 constexpr uint8_t DEBOUNCE_SAMPLES = 3;
 
+// Dashed-line following (terpisah dari followLine)
+constexpr unsigned long DASHED_COAST_MS = 250;
+constexpr unsigned long DASHED_SEARCH_MS = 1500;
+constexpr unsigned long DASHED_SWEEP_MS = 180;
+constexpr uint8_t DASHED_REACQUIRE_SAMPLES = 3;
+constexpr int DASHED_RELEASE_STRENGTH = 300;
+constexpr int DASHED_SEARCH_SPEED = 100;
+constexpr int DASHED_SWEEP_BIAS = 55;
+
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Servo gripper;
 Servo lift;
@@ -75,6 +84,14 @@ int linePosition = 0;
 int lastError = 0;
 int filteredDerivative = 0;
 int lastSeenSide = 1;
+
+bool dashedLineWasVisible = false;
+bool dashedInGap = false;
+unsigned long dashedHiddenSince = 0;
+int dashedLastCorrection = 0;
+int dashedLastError = 0;
+int dashedFilteredDerivative = 0;
+uint8_t dashedReacquireStreak = 0;
 
 void selectMuxChannel(uint8_t channelA, uint8_t channelB, uint8_t channelC) {
   digitalWrite(MUX_SELECT_A, channelA);
@@ -308,6 +325,86 @@ void followLine(int baseSpeed) {
   delay(SAMPLE_MS);
 }
 
+// Line follower untuk garis putus-putus: menjembatani celah pendek dengan
+// koreksi terakhir, lalu menyapu jika garis tidak kembali.
+void followLineDashed(int baseSpeed) {
+  updateLineState();
+
+  bool visible = lineSeen((int)lineStrength, dashedLineWasVisible,
+                          MIN_LINE_STRENGTH, DASHED_RELEASE_STRENGTH);
+
+  if (visible) {
+    dashedLineWasVisible = true;
+    if (dashedReacquireStreak < DASHED_REACQUIRE_SAMPLES) {
+      dashedReacquireStreak++;
+    }
+  } else {
+    dashedLineWasVisible = false;
+    dashedReacquireStreak = 0;
+  }
+
+  bool reacquired =
+      visible &&
+      (!dashedInGap || dashedReacquireStreak >= DASHED_REACQUIRE_SAMPLES);
+
+  if (reacquired) {
+    if (dashedInGap) {
+      // Bumpless reacquire: cegah lonjakan suku D saat posisi garis melompat.
+      dashedLastError = SET_POINT - linePosition;
+      dashedFilteredDerivative = 0;
+      dashedInGap = false;
+    }
+
+    int error = SET_POINT - linePosition;
+    int derivative = error - dashedLastError;
+    dashedLastError = error;
+    dashedFilteredDerivative =
+        lowPassStep(dashedFilteredDerivative, derivative, DERIVATIVE_ALPHA);
+
+    int correction = KP * error + KD * dashedFilteredDerivative;
+    correction = constrain(correction, -baseSpeed, baseSpeed);
+    dashedLastCorrection = correction;
+
+    int leftPwm = constrain(baseSpeed - correction, MIN_PWM, baseSpeed);
+    int rightPwm = constrain(baseSpeed + correction, MIN_PWM, baseSpeed);
+    driveMotors(leftPwm, rightPwm);
+    delay(SAMPLE_MS);
+    return;
+  }
+
+  if (!dashedInGap) {
+    dashedInGap = true;
+    dashedHiddenSince = millis();
+  }
+
+  unsigned long hiddenMs = millis() - dashedHiddenSince;
+  GapPhase phase = gapPhase(hiddenMs, DASHED_COAST_MS, DASHED_SEARCH_MS);
+
+  if (phase == GAP_COAST) {
+    int coastCorrection =
+        constrain(dashedLastCorrection, -baseSpeed, baseSpeed);
+    int leftPwm = constrain(baseSpeed - coastCorrection, MIN_PWM, baseSpeed);
+    int rightPwm = constrain(baseSpeed + coastCorrection, MIN_PWM, baseSpeed);
+    driveMotors(leftPwm, rightPwm);
+    delay(SAMPLE_MS);
+    return;
+  }
+
+  if (phase == GAP_LOST) {
+    // Berhenti tanpa stopMotors(): jangan menulis servo gripper tiap sampel.
+    driveMotors(0, 0);
+    delay(SAMPLE_MS);
+    return;
+  }
+
+  // GAP_SEARCH: maju pelan sambil menyapu kiri/kanan.
+  int direction = sweepDirection(hiddenMs, DASHED_COAST_MS, DASHED_SWEEP_MS);
+  int leftPwm = DASHED_SEARCH_SPEED + direction * DASHED_SWEEP_BIAS;
+  int rightPwm = DASHED_SEARCH_SPEED - direction * DASHED_SWEEP_BIAS;
+  driveMotors(constrain(leftPwm, 0, 255), constrain(rightPwm, 0, 255));
+  delay(SAMPLE_MS);
+}
+
 void driveForward(int leftPwm, int rightPwm, int seconds) {
   for (int i = 0; i <= seconds * 1000; i++) {
     driveMotors(leftPwm, rightPwm);
@@ -323,6 +420,12 @@ void driveBackward(int leftPwm, int rightPwm, int seconds) {
 void followLineForTicks(int speed, int ticks) {
   for (int i = 0; i <= ticks * 10; i++) {
     followLine(speed);
+  }
+}
+
+void followLineForTicksDashed(int speed, int ticks) {
+  for (int i = 0; i <= ticks * 10; i++) {
+    followLineDashed(speed);
   }
 }
 
